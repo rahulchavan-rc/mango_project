@@ -1,9 +1,18 @@
 from __future__ import annotations
 
 import json
+import platform
+import queue
+import shutil
+import subprocess
+import tempfile
+import threading
 import time
+import uuid
+from concurrent.futures import Future, ThreadPoolExecutor
 from functools import lru_cache
 from pathlib import Path
+from textwrap import wrap
 
 import joblib
 import numpy as np
@@ -91,7 +100,10 @@ def load_validity_model() -> tf.keras.Model | None:
     model_path = next((path for path in VALIDITY_MODEL_CANDIDATES if path.exists()), None)
     if model_path is None:
         return None
-    model = tf.keras.models.load_model(model_path, custom_objects=CUSTOM_LOAD_OBJECTS)
+    try:
+        model = tf.keras.models.load_model(model_path, custom_objects=CUSTOM_LOAD_OBJECTS)
+    except Exception as exc:
+        raise RuntimeError(f"Could not load mango-validity model at {model_path}: {exc}") from exc
     print(f"Loaded Validity Model: {model_path.name}")
     return model
 
@@ -169,6 +181,10 @@ OOD_INVALID_MARGIN = 0.08
 MIN_OBJECT_AREA_RATIO = 0.015
 MAX_OBJECT_AREA_RATIO = 0.98
 MIN_BORDER_MARGIN_PIXELS = 3
+CAMERA_SIDES = ("right", "left", "front", "back")
+CAMERA_CAPTURE_DELAY_SECONDS = 0.0
+CAMERA_STABLE_FRAMES_REQUIRED = 1
+MIN_ELIGIBLE_CAMERA_VIEWS = 2
 
 
 def object_shape_size(path: Path) -> dict[str, float | bool]:
@@ -390,44 +406,118 @@ def predict_captured_views(
     validity_model: tf.keras.Model | None,
     grade_model: tf.keras.Model,
     image_paths: list[Path],
-) -> None:
+    cancel_event: threading.Event | None = None,
+) -> dict:
+    if validity_model is None:
+        raise RuntimeError(
+            "Four-view camera prediction requires the trained mango-validity model; "
+            "the check will not be skipped."
+        )
+    if len(image_paths) != len(CAMERA_SIDES):
+        raise ValueError(
+            f"Four-view prediction requires exactly one image for each side: {CAMERA_SIDES}."
+        )
+    path_sides = [path.stem.rsplit("_", 1)[-1] for path in image_paths]
+    if tuple(path_sides) != CAMERA_SIDES:
+        raise ValueError(
+            "Camera views must be provided in Right, Left, Front, Back order, "
+            f"one image per side; received {path_sides}."
+        )
+
     class_names = load_class_names()
     feature_db = load_feature_database()
-    results = [
-        predict_single_image(validity_model, grade_model, class_names, path, feature_db=feature_db)
-        for path in image_paths
+    results = []
+    for path in image_paths:
+        if cancel_event is not None and cancel_event.is_set():
+            return {
+                "status": "CANCELLED",
+                "predicted_grade": None,
+                "grade_confidence": None,
+                "eligible_views": 0,
+                "combined_scores": {},
+                "announcement": "Prediction cancelled.",
+            }
+        results.append(
+            predict_single_image(validity_model, grade_model, class_names, path, feature_db=feature_db)
+        )
+    if cancel_event is not None and cancel_event.is_set():
+        return {
+            "status": "CANCELLED",
+            "predicted_grade": None,
+            "grade_confidence": None,
+            "eligible_views": 0,
+            "combined_scores": {},
+            "announcement": "Prediction cancelled.",
+        }
+
+    # LOW_CONFIDENCE views retain their probability vectors as in the existing
+    # averaging behavior; shape failures, non-mangoes, and OOD views do not.
+    eligible_results = [
+        result
+        for result in results
+        if result["status"] in {"VALID", "LOW_CONFIDENCE"} and result["class_scores"]
     ]
-    grade_results = [result for result in results if result["class_scores"]]
 
     print("\nPHOTO RESULTS")
     for result in results:
         print(f"{Path(result['image_path']).name}: {result['status']}")
 
-    if len(grade_results) < 2:
-        print("\nCombined grade unavailable: fewer than two photos passed the mango checks.")
+    if len(eligible_results) < MIN_ELIGIBLE_CAMERA_VIEWS:
+        print(
+            "\nCombined grade unavailable: fewer than "
+            f"{MIN_ELIGIBLE_CAMERA_VIEWS} views passed the mango and out-of-distribution checks."
+        )
         for result in results:
             rejection_reason = result.get("rejection_reason")
             if rejection_reason:
                 print(f"{Path(result['image_path']).name}: {rejection_reason.replace('_', ' ')}")
-        return
+        return {
+            "status": "UNCERTAIN",
+            "predicted_grade": None,
+            "grade_confidence": None,
+            "eligible_views": len(eligible_results),
+            "combined_scores": {},
+            "announcement": (
+                "The result is uncertain. Fewer than two views passed the mango and "
+                "out-of-distribution checks."
+            ),
+        }
 
     combined_scores = {
-        name: float(np.mean([result["class_scores"][name] for result in grade_results]))
+        name: float(np.mean([result["class_scores"][name] for result in eligible_results]))
         for name in class_names
     }
     predicted_grade = max(combined_scores, key=combined_scores.get)
     confidence = combined_scores[predicted_grade]
+    confident = confidence >= GRADE_CONFIDENCE_THRESHOLD
     print("\nCOMBINED PREDICTION")
-    print(f"Photos combined: {len(grade_results)}/{len(image_paths)}")
+    print(f"Eligible views combined: {len(eligible_results)}/{len(CAMERA_SIDES)}")
     print(f"Predicted grade: {predicted_grade.title()}")
     print(f"Grade confidence: {confidence * 100:.2f}%")
-    if confidence < GRADE_CONFIDENCE_THRESHOLD:
-        print("Result: Low confidence")
+    if not confident:
+        print("Result: Uncertain — combined confidence is below the threshold.")
+        announcement = (
+            "The result is uncertain. The combined grade confidence is "
+            f"{confidence * 100:.1f} percent, below the required "
+            f"{GRADE_CONFIDENCE_THRESHOLD * 100:.0f} percent."
+        )
     else:
-        print("Result: Mango")
+        print("Result: Confident grade prediction")
+        announcement = (
+            f"The final grade is {predicted_grade.title()}, with "
+            f"{confidence * 100:.1f} percent confidence."
+        )
     print("Grade scores:")
     for grade, score in combined_scores.items():
         print(f"  {grade.title()}: {score * 100:.2f}%")
+    return {
+        "status": "CONFIDENT" if confident else "UNCERTAIN",
+        "predicted_grade": predicted_grade,
+        "grade_confidence": confidence,
+        "eligible_views": len(eligible_results),
+        "combined_scores": combined_scores,
+        "announcement": announcement,
+    }
 
 
 def predict_path(
@@ -551,7 +641,226 @@ def _detect_object_bounds(frame: np.ndarray, cv2) -> tuple[int, int, int, int] |
     return x, y, width, height
 
 
-def capture_photos(camera_index: int = 0, count: int = 4, interval_seconds: float = 4.0) -> list[Path]:
+def _camera_side_prompt(side: str) -> str:
+    return f"Please show the {side} side of the mango. Click when ready."
+
+
+def _camera_transition_announcement(side: str, next_side: str | None) -> str:
+    if next_side is None:
+        return "Back side captured. Please wait for the model prediction."
+    return f"{side.title()} side captured. Please show the {next_side} side."
+
+
+def _has_camera_frame_margin(
+    bounds: tuple[int, int, int, int],
+    frame_shape: tuple[int, ...],
+) -> bool:
+    x, y, width, height = bounds
+    frame_height, frame_width = frame_shape[:2]
+    margin = max(8, int(min(frame_height, frame_width) * 0.015))
+    return (
+        x >= margin
+        and y >= margin
+        and x + width <= frame_width - margin
+        and y + height <= frame_height - margin
+    )
+
+
+def _validate_and_save_camera_capture(
+    frame: np.ndarray,
+    side: str,
+    session_id: str,
+    capture_dir: Path,
+    validity_model: tf.keras.Model,
+    cv2,
+    cancel_event: threading.Event,
+) -> tuple[Path | None, str | None]:
+    bounds = _detect_object_bounds(frame, cv2)
+    if bounds is None:
+        return None, "object_shape_or_size_check"
+    if not _has_camera_frame_margin(bounds, frame.shape):
+        return None, "object_near_frame_edge"
+
+    x, y, width, height = bounds
+    padding_x = max(2, int(width * 0.10))
+    padding_y = max(2, int(height * 0.10))
+    left = max(0, x - padding_x)
+    top = max(0, y - padding_y)
+    right = min(frame.shape[1], x + width + padding_x)
+    bottom = min(frame.shape[0], y + height + padding_y)
+    crop = frame[top:bottom, left:right].copy()
+    if crop.size == 0:
+        return None, "empty_crop"
+
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+        if not cv2.imwrite(str(temporary_path), crop):
+            raise RuntimeError("Could not prepare the camera crop for mango validation.")
+
+        shape_check = object_shape_size(temporary_path)
+        if not shape_check["detected"] or not shape_check.get("has_frame_margin", False):
+            return None, str(shape_check.get("rejection_reason", "mango_shape_classifier"))
+
+        image_tensor = preprocess_image(temporary_path)
+        validity_probabilities = validity_model.predict(image_tensor, verbose=0)[0]
+        probability_valid = float(validity_probabilities[0])
+        if probability_valid < VALID_MANGO_THRESHOLD:
+            return None, "mango_appearance_check"
+        if cancel_event.is_set():
+            return None, "capture_cancelled"
+
+        capture_dir.mkdir(parents=True, exist_ok=True)
+        photo_path = capture_dir / f"camera_capture_{session_id}_{side}.jpg"
+        encoded, image_buffer = cv2.imencode(".jpg", crop)
+        if not encoded:
+            raise RuntimeError("OpenCV could not encode the validated camera crop.")
+        with photo_path.open("xb") as output_file:
+            output_file.write(image_buffer.tobytes())
+        return photo_path, None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+class _OfflineSpeech:
+    def __init__(self) -> None:
+        system = platform.system()
+        if system == "Darwin" and shutil.which("say"):
+            self.command = "say"
+        elif system == "Linux":
+            self.command = shutil.which("espeak-ng") or shutil.which("espeak")
+        else:
+            self.command = None
+
+        self.messages: queue.Queue[str | None] = queue.Queue()
+        self.lock = threading.Lock()
+        self.process: subprocess.Popen | None = None
+        self.stopping = threading.Event()
+        self.worker: threading.Thread | None = None
+        if self.command is None:
+            print(
+                "Offline speech is unavailable. Instructions will remain visible in the preview; "
+                "install espeak-ng on Linux to enable speech."
+            )
+        else:
+            self.worker = threading.Thread(target=self._speak_queued_messages, daemon=True)
+            self.worker.start()
+
+    def say(self, message: str) -> None:
+        if self.command is not None and not self.stopping.is_set():
+            self.messages.put(message)
+
+    def _speak_queued_messages(self) -> None:
+        while not self.stopping.is_set():
+            message = self.messages.get()
+            if message is None:
+                return
+            try:
+                with self.lock:
+                    if self.stopping.is_set():
+                        return
+                    process = subprocess.Popen(
+                        [self.command, message],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    self.process = process
+                return_code = process.wait()
+                if return_code != 0 and not self.stopping.is_set():
+                    print(f"Offline speech exited with status {return_code}; instructions remain visible.")
+            except OSError as exc:
+                print(f"Offline speech could not be started: {exc}. Instructions remain visible.")
+                self.command = None
+                return
+            finally:
+                with self.lock:
+                    self.process = None
+
+    def stop(self, graceful: bool = False) -> None:
+        if graceful and self.worker is not None:
+            self.messages.put(None)
+            self.worker.join(timeout=30.0)
+            graceful = not self.worker.is_alive()
+        self.stopping.set()
+        while True:
+            try:
+                self.messages.get_nowait()
+            except queue.Empty:
+                break
+        with self.lock:
+            process = self.process
+        if process is not None and process.poll() is None:
+            process.terminate()
+        if not graceful:
+            self.messages.put(None)
+        if self.worker is not None:
+            self.worker.join(timeout=1.0)
+
+
+def _draw_camera_preview(
+    preview: np.ndarray,
+    cv2,
+    state: str,
+    side: str,
+    prompt: str,
+    notice: str,
+    stable_frames: int,
+    countdown_seconds: float | None,
+    bounds: tuple[int, int, int, int] | None,
+) -> None:
+    if bounds is not None:
+        x, y, width, height = bounds
+        color = (0, 220, 0) if stable_frames >= CAMERA_STABLE_FRAMES_REQUIRED else (0, 220, 255)
+        cv2.rectangle(preview, (x, y), (x + width, y + height), color, 2)
+
+    height, width = preview.shape[:2]
+    lines = [f"View: {side.title()} | State: {state.replace('_', ' ').title()}"]
+    if notice:
+        lines.extend(wrap(notice, width=max(24, width // 14)))
+    lines.extend(wrap(prompt, width=max(24, width // 14)))
+    if state == "waiting_for_side":
+        lines.append(
+            f"Hold still: {min(stable_frames, CAMERA_STABLE_FRAMES_REQUIRED)}"
+            f"/{CAMERA_STABLE_FRAMES_REQUIRED} frames"
+        )
+    if countdown_seconds is not None:
+        lines.append(f"Capture in {countdown_seconds:.1f} seconds")
+    if state == "prediction" and prompt.startswith("Prediction complete"):
+        lines.append("Press q to close.")
+
+    line_height = 26
+    overlay_height = min(height, 12 + line_height * len(lines))
+    cv2.rectangle(preview, (0, 0), (width, overlay_height), (20, 20, 20), -1)
+    for line_number, line in enumerate(lines):
+        cv2.putText(
+            preview,
+            line,
+            (12, 22 + line_number * line_height),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.58,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+
+
+def capture_photos(
+    camera_index: int = 0,
+    validity_model: tf.keras.Model | None = None,
+    grade_model: tf.keras.Model | None = None,
+) -> list[Path]:
+    if validity_model is None:
+        raise RuntimeError(
+            "Camera capture requires the trained mango-validity model. "
+            "Place a validity model in validity_runs/best_validity.keras, "
+            "validity_runs/final_validity.keras, or final_validity.keras."
+        )
+    if grade_model is None:
+        raise RuntimeError("Camera capture requires the trained mango-grade model.")
+    load_shape_gate()
+
     try:
         from importlib import import_module
 
@@ -569,30 +878,39 @@ def capture_photos(camera_index: int = 0, count: int = 4, interval_seconds: floa
         )
 
     window_name = "Mango photo capture"
-    stable_frames_required = 8
-    print(
-        f"Place one object in view and hold it still. Click the preview to capture each photo, "
-        f"with at least {interval_seconds:g} seconds between photos; press 'q' to quit."
-    )
-    captured_objects = []
-    next_capture_time = 0.0
+    capture_dir = PROJECT_ROOT / "captured_photos"
+    session_id = uuid.uuid4().hex
+    captured_paths: list[Path] = []
+    side_index = 0
+    state = "waiting_for_side"
+    prompt = _camera_side_prompt(CAMERA_SIDES[side_index])
+    notice = ""
+    countdown_deadline: float | None = None
+    pending_path: Path | None = None
+    work_future: Future | None = None
+    cancel_event = threading.Event()
+    graceful_speech_stop = False
     previous_bounds = None
     stable_frames = 0
+    click_request = {"requested": False, "state": state}
 
-    def request_capture(event, x, y, flags, parameter):
-        if event == cv2.EVENT_LBUTTONDOWN:
+    def request_capture(event, _x, _y, _flags, parameter):
+        if event == cv2.EVENT_LBUTTONDOWN and parameter["state"] == "waiting_for_side":
             parameter["requested"] = True
 
-    cv2.namedWindow(window_name)
-    capture_request = {"requested": False}
-    cv2.setMouseCallback(window_name, request_capture, capture_request)
+    speech = _OfflineSpeech()
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mango-camera-inference")
     try:
+        cv2.namedWindow(window_name)
+        cv2.setMouseCallback(window_name, request_capture, click_request)
+        speech.say("Please show the right side of the mango. Click when ready.")
+        print("Camera ready. Capture order: Right -> Left -> Front -> Back -> Prediction. Press 'q' to cancel.")
+
         while True:
             success, frame = camera.read()
             if not success:
                 raise RuntimeError("Could not read a frame from the camera.")
             bounds = _detect_object_bounds(frame, cv2)
-            preview = frame.copy()
             if bounds is not None:
                 x, y, width, height = bounds
                 if previous_bounds is not None:
@@ -610,89 +928,139 @@ def capture_photos(camera_index: int = 0, count: int = 4, interval_seconds: floa
                 else:
                     stable_frames = 1
                 previous_bounds = bounds
-                cv2.rectangle(preview, (x, y), (x + width, y + height), (0, 255, 0), 2)
-                cv2.putText(
-                    preview,
-                    f"Photo {len(captured_objects) + 1}/{count} | Object: {stable_frames}/{stable_frames_required}",
-                    (x, max(y - 10, 25)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (0, 255, 0),
-                    2,
-                )
-                now = time.monotonic()
-                if stable_frames >= stable_frames_required and now < next_capture_time:
-                    seconds_left = max(0, int(next_capture_time - now + 0.999))
-                    cv2.putText(
-                        preview,
-                        f"Next photo in {seconds_left}s",
-                        (x, min(y + height + 25, frame.shape[0] - 10)),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.7,
-                        (0, 255, 0),
-                        2,
-                    )
-                elif stable_frames >= stable_frames_required:
-                    cv2.putText(
-                        preview,
-                        "Click to capture",
-                        (x, min(y + height + 25, frame.shape[0] - 10)),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.7,
-                        (0, 255, 0),
-                        2,
-                    )
             else:
                 previous_bounds = None
                 stable_frames = 0
-                cv2.putText(
-                    preview,
-                    "Place one object in view",
-                    (20, 35),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (0, 255, 255),
-                    2,
-                )
+
+            now = time.monotonic()
+            countdown_seconds = None
+            if state == "countdown" and countdown_deadline is not None:
+                countdown_seconds = max(0.0, countdown_deadline - now)
+                if countdown_seconds <= 0:
+                    countdown_seconds = None
+                    if (
+                        bounds is None
+                        or stable_frames < CAMERA_STABLE_FRAMES_REQUIRED
+                        or not _has_camera_frame_margin(bounds, frame.shape)
+                    ):
+                        state = "waiting_for_side"
+                        countdown_deadline = None
+                        notice = "Please click again to retry."
+                        prompt = "Click the image when ready for the next capture."
+                    else:
+                        side = CAMERA_SIDES[side_index]
+                        state = "validation"
+                        countdown_deadline = None
+                        notice = "Checking the fresh frame with the mango models..."
+                        work_future = executor.submit(
+                            _validate_and_save_camera_capture,
+                            frame.copy(),
+                            side,
+                            session_id,
+                            capture_dir,
+                            validity_model,
+                            cv2,
+                            cancel_event,
+                        )
+
+            if state == "validation" and work_future is not None and work_future.done():
+                try:
+                    pending_path, rejection_reason = work_future.result()
+                except Exception as exc:
+                    raise RuntimeError(
+                        "Camera mango validation failed. Capture stopped rather than bypassing "
+                        "the shape-gate or validity model."
+                    ) from exc
+                work_future = None
+                if pending_path is None:
+                    if rejection_reason == "capture_cancelled" and cancel_event.is_set():
+                        return []
+                    state = "waiting_for_side"
+                    notice = "Please click again to retry."
+                    prompt = "Click the image when ready for the next capture."
+                else:
+                    state = "saved_capture"
+                    notice = f"{CAMERA_SIDES[side_index].title()} side captured."
+                    if side_index < len(CAMERA_SIDES) - 1:
+                        prompt = _camera_side_prompt(CAMERA_SIDES[side_index + 1])
+                    else:
+                        prompt = "Please wait for the model prediction."
+
+            if state == "prediction" and work_future is not None and work_future.done():
+                try:
+                    prediction = work_future.result()
+                except Exception as exc:
+                    raise RuntimeError("Four-view model prediction failed.") from exc
+                work_future = None
+                notice = prediction["announcement"]
+                prompt = "Prediction complete. Press q to close."
+                speech.say(prediction["announcement"])
+
+            if state == "waiting_for_side" and click_request["requested"]:
+                click_request["requested"] = False
+                state = "countdown"
+                notice = "Hold one mango still and fully inside the frame."
+                prompt = "Keep the mango steady and click again for the next capture."
+                countdown_deadline = now + CAMERA_CAPTURE_DELAY_SECONDS
+
+            click_request["state"] = state
+            preview = frame.copy()
+            _draw_camera_preview(
+                preview,
+                cv2,
+                state,
+                CAMERA_SIDES[min(side_index, len(CAMERA_SIDES) - 1)],
+                prompt,
+                notice,
+                stable_frames,
+                countdown_seconds,
+                bounds,
+            )
             cv2.imshow(window_name, preview)
             key = cv2.waitKey(1) & 0xFF
-            if len(captured_objects) >= count:
-                break
             if key == ord("q"):
-                raise SystemExit("Camera capture cancelled.")
-            if capture_request["requested"]:
-                capture_request["requested"] = False
-                now = time.monotonic()
-                if bounds is None or stable_frames < stable_frames_required:
-                    print("Object is not stable yet. Wait for the green box before clicking.")
-                elif now < next_capture_time:
-                    wait_seconds = next_capture_time - now
-                    print(f"Wait {wait_seconds:.1f} seconds before capturing the next photo.")
+                if state == "prediction" and work_future is None and prompt.startswith("Prediction complete"):
+                    graceful_speech_stop = True
+                    break
+                print("Camera capture cancelled.")
+                cancel_event.set()
+                return []
+
+            if state == "saved_capture" and pending_path is not None:
+                captured_paths.append(pending_path)
+                print(f"Saved {CAMERA_SIDES[side_index]} view to: {pending_path}")
+                next_side_index = side_index + 1
+                transition = _camera_transition_announcement(
+                    CAMERA_SIDES[side_index],
+                    CAMERA_SIDES[next_side_index] if next_side_index < len(CAMERA_SIDES) else None,
+                )
+                speech.say(transition)
+                pending_path = None
+                side_index = next_side_index
+                if side_index == len(CAMERA_SIDES):
+                    state = "prediction"
+                    notice = "Back side captured."
+                    prompt = "Please wait for the model prediction."
+                    work_future = executor.submit(
+                        predict_captured_views,
+                        validity_model,
+                        grade_model,
+                        captured_paths.copy(),
+                        cancel_event,
+                    )
                 else:
-                    x, y, width, height = bounds
-                    padding_x = int(width * 0.04)
-                    padding_y = int(height * 0.04)
-                    left = max(0, x - padding_x)
-                    top = max(0, y - padding_y)
-                    right = min(frame.shape[1], x + width + padding_x)
-                    bottom = min(frame.shape[0], y + height + padding_y)
-                    captured_objects.append(frame[top:bottom, left:right].copy())
-                    print(f"Captured photo {len(captured_objects)}/{count}")
-                    next_capture_time = now + interval_seconds
+                    state = "waiting_for_side"
+                    notice = f"{CAMERA_SIDES[side_index - 1].title()} side captured."
+                    prompt = _camera_side_prompt(CAMERA_SIDES[side_index])
+
+            click_request["state"] = state
     finally:
+        cancel_event.set()
         camera.release()
         cv2.destroyAllWindows()
-
-    capture_dir = PROJECT_ROOT / "captured_photos"
-    capture_dir.mkdir(parents=True, exist_ok=True)
-    photo_paths = []
-    for index, captured_object in enumerate(captured_objects, start=1):
-        photo_path = capture_dir / f"camera_capture_{index}.jpg"
-        if not cv2.imwrite(str(photo_path), captured_object):
-            raise RuntimeError(f"Could not save captured photo to {photo_path}")
-        photo_paths.append(photo_path)
-        print(f"Captured photo saved to: {photo_path}")
-    return photo_paths
+        executor.shutdown(wait=False, cancel_futures=True)
+        speech.stop(graceful=graceful_speech_stop)
+    return captured_paths
 
 
 if __name__ == "__main__":
@@ -714,7 +1082,6 @@ if __name__ == "__main__":
     g_model = load_grade_model()
 
     if args.camera:
-        captured_paths = capture_photos(args.camera_index, count=4, interval_seconds=4.0)
-        predict_captured_views(v_model, g_model, captured_paths)
+        capture_photos(args.camera_index, v_model, g_model)
     else:
         predict_path(v_model, g_model, args.path)
