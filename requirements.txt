@@ -4,4 +4,4 @@ joblib==1.5.3
 opencv-python==4.10.0.84
 Pillow==11.3.0
 scipy==1.13.1
-scikit-learn==1.5.2
+scikit-learn==1.6.1
